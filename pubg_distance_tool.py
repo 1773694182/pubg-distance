@@ -1,4 +1,8 @@
+import ctypes
+import logging
 import math
+import threading
+import time
 import tkinter as tk
 from tkinter import ttk
 
@@ -13,8 +17,8 @@ RESOLUTIONS = {
     },
     "2560x1440": {
         "label": "2560x1440 (2K)",
-        "big_map_px_per_100m": 51.2,
-        "mini_map_px_per_100m": 153.0,
+        "big_map_px_per_100m": 18.0,
+        "mini_map_px_per_100m": 87.0,
     },
     "3840x2160": {
         "label": "3840x2160 (4K)",
@@ -28,29 +32,68 @@ MODES = {
     "mini": "小地图模式 (F1)",
 }
 
+CLICK_MODES = {
+    "side": "鼠标侧键",
+    "right": "鼠标右键",
+}
+
+LOG_FILE = "pubg_distance_tool.log"
+POLL_INTERVAL_SECONDS = 0.01
+POINT_DEDUP_SECONDS = 0.15
+VK_RBUTTON = 0x02
+VK_XBUTTON1 = 0x05
+VK_XBUTTON2 = 0x06
+VK_ESCAPE = 0x1B
+VK_M = 0x4D
+VK_F1 = 0x70
+VK_F2 = 0x71
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        ],
+    )
+
 
 class PubgDistanceTool:
     def __init__(self, root):
         self.root = root
         self.root.title("PUBG 测距工具")
-        self.root.geometry("620x260+30+30")
+        self.root.geometry("620x290+30+30")
         self.root.resizable(False, False)
 
         self.resolution = tk.StringVar(value="1920x1080")
         self.mode = tk.StringVar(value="big")
-        self.status = tk.StringVar(value="使用鼠标侧键在屏幕任意位置标记第一个点。")
+        self.click_mode = tk.StringVar(value="side")
+        self.status = tk.StringVar()
         self.distance_text = tk.StringVar(value="-- 米")
         self.scale_text = tk.StringVar()
         self.points = []
         self.mouse_listener = None
         self.keyboard_listener = None
+        self.poll_thread = None
+        self.poll_stop_event = threading.Event()
+        self.poll_key_states = {}
+        self.last_point_time = 0.0
 
         self._build_ui()
         self._build_distance_overlay()
         self._bind_window_keys()
         self._start_global_listeners()
         self._update_scale_text()
+        self._update_waiting_status()
+        self.root.report_callback_exception = self._log_tk_exception
         self.root.protocol("WM_DELETE_WINDOW", self.close)
+        logging.info("程序启动完成，日志文件：%s", LOG_FILE)
 
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
@@ -70,7 +113,7 @@ class PubgDistanceTool:
 
         subtitle = tk.Label(
             card,
-            text="鼠标侧键标点，全屏任意位置测距",
+            text="可选鼠标侧键或右键标点，全屏任意位置测距",
             bg="#101820",
             fg="#8ea3b7",
             font=("Microsoft YaHei UI", 10),
@@ -107,6 +150,22 @@ class PubgDistanceTool:
         ).grid(row=0, column=3, padx=(0, 12), pady=6)
         ttk.Button(controls, text="重新计算 F2", command=self.reset).grid(row=0, column=4, pady=6)
 
+        ttk.Label(controls, text="取点按键").grid(row=1, column=0, padx=(0, 6), pady=6)
+        ttk.Radiobutton(
+            controls,
+            text="鼠标侧键",
+            value="side",
+            variable=self.click_mode,
+            command=self.recalculate,
+        ).grid(row=1, column=1, sticky="w", padx=(0, 18), pady=6)
+        ttk.Radiobutton(
+            controls,
+            text="鼠标右键",
+            value="right",
+            variable=self.click_mode,
+            command=self.recalculate,
+        ).grid(row=1, column=2, sticky="w", padx=(0, 8), pady=6)
+
         body = ttk.Frame(self.root, padding=(12, 8))
         body.grid(row=2, column=0, sticky="ew")
         body.columnconfigure(0, weight=1)
@@ -114,7 +173,7 @@ class PubgDistanceTool:
         ttk.Label(body, textvariable=self.scale_text).grid(row=0, column=0, sticky="w")
         ttk.Label(
             body,
-            text="鼠标侧键：标点；M：大地图；F1：小地图；F2/Esc：清空。",
+            text="取点按键：标点；M：大地图；F1：小地图；F2/Esc：清空。",
         ).grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Label(
             body,
@@ -154,6 +213,83 @@ class PubgDistanceTool:
         self.keyboard_listener.daemon = True
         self.mouse_listener.start()
         self.keyboard_listener.start()
+        self.poll_thread = threading.Thread(target=self._poll_windows_input, daemon=True)
+        self.poll_thread.start()
+        logging.info("全局鼠标和键盘监听已启动")
+
+    def _poll_windows_input(self):
+        logging.info("Windows GetAsyncKeyState 轮询监听已启动")
+        try:
+            while not self.poll_stop_event.is_set():
+                self._poll_mouse_buttons()
+                self._poll_keyboard_keys()
+                time.sleep(POLL_INTERVAL_SECONDS)
+        except Exception:
+            logging.exception("Windows 轮询监听线程出错")
+
+    def _poll_mouse_buttons(self):
+        for vk_code, button_name in (
+            (VK_RBUTTON, "right"),
+            (VK_XBUTTON1, "x1"),
+            (VK_XBUTTON2, "x2"),
+        ):
+            pressed = self._is_vk_pressed(vk_code)
+            was_pressed = self.poll_key_states.get(vk_code, False)
+            if pressed != was_pressed:
+                x, y = self._get_cursor_position()
+                logging.debug(
+                    "轮询鼠标事件：button=%s vk=0x%02X pressed=%s x=%s y=%s click_mode=%s matched=%s",
+                    button_name,
+                    vk_code,
+                    pressed,
+                    x,
+                    y,
+                    self.click_mode.get(),
+                    self._is_poll_point_button(button_name),
+                )
+                if pressed and self._is_poll_point_button(button_name):
+                    self._queue_screen_point(x, y, f"poll:{button_name}")
+            self.poll_key_states[vk_code] = pressed
+
+    def _poll_keyboard_keys(self):
+        for vk_code, key_name in (
+            (VK_F1, "f1"),
+            (VK_F2, "f2"),
+            (VK_ESCAPE, "esc"),
+            (VK_M, "m"),
+        ):
+            pressed = self._is_vk_pressed(vk_code)
+            was_pressed = self.poll_key_states.get(vk_code, False)
+            if pressed != was_pressed:
+                logging.debug("轮询键盘事件：key=%s vk=0x%02X pressed=%s", key_name, vk_code, pressed)
+                if pressed:
+                    self._handle_poll_key(key_name)
+            self.poll_key_states[vk_code] = pressed
+
+    def _is_vk_pressed(self, vk_code):
+        return bool(ctypes.windll.user32.GetAsyncKeyState(vk_code) & 0x8000)
+
+    def _get_cursor_position(self):
+        point = POINT()
+        if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+            return int(point.x), int(point.y)
+        logging.error("GetCursorPos 获取鼠标坐标失败")
+        return 0, 0
+
+    def _is_poll_point_button(self, button_name):
+        if self.click_mode.get() == "right":
+            return button_name == "right"
+        return button_name in ("x1", "x2")
+
+    def _handle_poll_key(self, key_name):
+        if key_name == "f1":
+            self.root.after(0, self.set_mode, "mini")
+            return
+        if key_name == "f2" or key_name == "esc":
+            self.root.after(0, self.reset)
+            return
+        if key_name == "m":
+            self.root.after(0, self.set_mode, "big")
 
     def _position_overlay(self):
         self.overlay.update_idletasks()
@@ -168,49 +304,88 @@ class PubgDistanceTool:
         self.overlay.after(1000, self._position_overlay)
 
     def _on_global_click(self, x, y, button, pressed):
-        if not pressed:
+        try:
+            logging.debug(
+                "鼠标事件：button=%s pressed=%s x=%s y=%s click_mode=%s matched=%s",
+                button,
+                pressed,
+                x,
+                y,
+                self.click_mode.get(),
+                self._is_point_button(button),
+            )
+            if not pressed:
+                return
+            if not self._is_point_button(button):
+                return
+            self._queue_screen_point(int(x), int(y), f"pynput:{button}")
+        except Exception:
+            logging.exception("处理鼠标事件时出错")
+
+    def _queue_screen_point(self, x, y, source):
+        now = time.monotonic()
+        if now - self.last_point_time < POINT_DEDUP_SECONDS:
+            logging.debug("忽略重复取点事件：source=%s x=%s y=%s", source, x, y)
             return
-        if button not in (mouse.Button.x1, mouse.Button.x2):
-            return
+        self.last_point_time = now
+        logging.info("提交取点事件：source=%s x=%s y=%s", source, x, y)
         self.root.after(0, self.add_screen_point, int(x), int(y))
 
+    def _is_point_button(self, button):
+        if self.click_mode.get() == "right":
+            return button == mouse.Button.right
+        return button in (mouse.Button.x1, mouse.Button.x2)
+
     def _on_global_key_press(self, key):
-        if key == keyboard.Key.f1:
-            self.root.after(0, self.set_mode, "mini")
-            return
-        if key == keyboard.Key.f2 or key == keyboard.Key.esc:
-            self.root.after(0, self.reset)
-            return
         try:
+            logging.debug("键盘事件：key=%s", key)
+            if key == keyboard.Key.f1:
+                self.root.after(0, self.set_mode, "mini")
+                return
+            if key == keyboard.Key.f2 or key == keyboard.Key.esc:
+                self.root.after(0, self.reset)
+                return
             if key.char and key.char.lower() == "m":
                 self.root.after(0, self.set_mode, "big")
         except AttributeError:
             pass
+        except Exception:
+            logging.exception("处理键盘事件时出错")
 
     def set_mode(self, mode):
         self.mode.set(mode)
+        logging.info("切换地图模式：%s", MODES[mode])
         self.recalculate()
 
     def reset(self):
         self.points.clear()
         self.distance_text.set("-- 米")
-        self.status.set(f"已清空。当前为 {MODES[self.mode.get()]}，请用鼠标侧键标记两个点。")
+        self.status.set(f"已清空。当前为 {MODES[self.mode.get()]}，请用{self._click_button_label()}标记两个点。")
         self._update_scale_text()
+        logging.info("已清空取点")
 
     def recalculate(self):
         self._update_scale_text()
+        logging.info(
+            "重新计算：resolution=%s mode=%s click_mode=%s points=%s",
+            self.resolution.get(),
+            self.mode.get(),
+            self.click_mode.get(),
+            self.points,
+        )
         if len(self.points) == 2:
             self._calculate_distance()
         else:
-            self.status.set(f"当前为 {MODES[self.mode.get()]}，请用鼠标侧键标记两个点。")
+            self._update_waiting_status()
 
     def add_screen_point(self, x, y):
         if len(self.points) == 2:
             self.reset()
 
         self.points.append((x, y))
+        logging.info("记录取点：index=%s x=%s y=%s", len(self.points), x, y)
         if len(self.points) == 1:
-            self.status.set(f"已记录第一个点：({x}, {y})。请用鼠标侧键标记第二个点。")
+            self.status.set(f"已记录第一个点：({x}, {y})。请用{self._click_button_label()}标记第二个点。")
             return
 
         self._calculate_distance()
@@ -225,6 +400,16 @@ class PubgDistanceTool:
         self.status.set(
             f"点1 ({x1}, {y1})，点2 ({x2}, {y2})，像素距离 {pixel_distance:.1f}px，估算 {meters:.0f} 米。"
         )
+        logging.info(
+            "距离计算完成：point1=(%s,%s) point2=(%s,%s) pixel_distance=%.1f meters=%.0f px_per_100m=%.1f",
+            x1,
+            y1,
+            x2,
+            y2,
+            pixel_distance,
+            meters,
+            self._pixels_per_100m(),
+        )
 
     def _pixels_per_100m(self):
         config = RESOLUTIONS[self.resolution.get()]
@@ -237,23 +422,39 @@ class PubgDistanceTool:
         mode_note = "精确按 4x4 大格估算" if self.mode.get() == "big" else "按小地图中值估算"
         self.scale_text.set(f"比例：100米 ≈ {px:.1f}px（{mode_note}）")
 
+    def _click_button_label(self):
+        return CLICK_MODES[self.click_mode.get()]
+
+    def _update_waiting_status(self):
+        self.status.set(f"当前为 {MODES[self.mode.get()]}，请用{self._click_button_label()}标记两个点。")
+
     def close(self):
+        logging.info("正在关闭程序")
         if self.mouse_listener is not None:
             self.mouse_listener.stop()
         if self.keyboard_listener is not None:
             self.keyboard_listener.stop()
+        self.poll_stop_event.set()
         if hasattr(self, "overlay"):
             self.overlay.destroy()
         self.root.destroy()
 
+    def _log_tk_exception(self, exc, val, tb):
+        logging.exception("Tkinter 回调出错", exc_info=(exc, val, tb))
+
 
 def main():
+    setup_logging()
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():
         style.theme_use("vista")
     PubgDistanceTool(root)
-    root.mainloop()
+    try:
+        root.mainloop()
+    except Exception:
+        logging.exception("主循环出错")
+        raise
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import ctypes
 import logging
 import math
+import os
+import sys
 import threading
 import time
 import tkinter as tk
@@ -40,6 +42,8 @@ CLICK_MODES = {
 LOG_FILE = "pubg_distance_tool.log"
 POLL_INTERVAL_SECONDS = 0.01
 POINT_DEDUP_SECONDS = 0.15
+ZOOM_STEP_FACTOR = 1.1
+ZOOM_MAX_2K_PX_PER_100M = 290.0
 VK_RBUTTON = 0x02
 VK_XBUTTON1 = 0x05
 VK_XBUTTON2 = 0x06
@@ -64,6 +68,14 @@ def setup_logging():
     )
 
 
+def is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        logging.exception("检测管理员权限失败")
+        return False
+
+
 class PubgDistanceTool:
     def __init__(self, root):
         self.root = root
@@ -77,6 +89,7 @@ class PubgDistanceTool:
         self.status = tk.StringVar()
         self.distance_text = tk.StringVar(value="-- 米")
         self.scale_text = tk.StringVar()
+        self.zoom_px_per_100m = None
         self.points = []
         self.mouse_listener = None
         self.keyboard_listener = None
@@ -93,7 +106,13 @@ class PubgDistanceTool:
         self._update_waiting_status()
         self.root.report_callback_exception = self._log_tk_exception
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        logging.info("程序启动完成，日志文件：%s", LOG_FILE)
+        logging.info(
+            "程序启动完成：admin=%s executable=%s cwd=%s log_file=%s",
+            is_admin(),
+            sys.executable,
+            os.getcwd(),
+            os.path.abspath(LOG_FILE),
+        )
 
     def _build_ui(self):
         self.root.columnconfigure(0, weight=1)
@@ -132,7 +151,7 @@ class PubgDistanceTool:
             state="readonly",
         )
         resolution_box.grid(row=0, column=1, padx=(0, 18), pady=6)
-        resolution_box.bind("<<ComboboxSelected>>", lambda _event: self.recalculate())
+        resolution_box.bind("<<ComboboxSelected>>", lambda _event: self.set_resolution())
 
         ttk.Radiobutton(
             controls,
@@ -207,7 +226,7 @@ class PubgDistanceTool:
         self.root.bind("<Escape>", lambda _event: self.reset())
 
     def _start_global_listeners(self):
-        self.mouse_listener = mouse.Listener(on_click=self._on_global_click)
+        self.mouse_listener = mouse.Listener(on_click=self._on_global_click, on_scroll=self._on_global_scroll)
         self.keyboard_listener = keyboard.Listener(on_press=self._on_global_key_press)
         self.mouse_listener.daemon = True
         self.keyboard_listener.daemon = True
@@ -322,6 +341,15 @@ class PubgDistanceTool:
         except Exception:
             logging.exception("处理鼠标事件时出错")
 
+    def _on_global_scroll(self, x, y, dx, dy):
+        try:
+            logging.debug("鼠标滚轮事件：x=%s y=%s dx=%s dy=%s", x, y, dx, dy)
+            if dy == 0:
+                return
+            self.root.after(0, self.adjust_zoom, int(dy))
+        except Exception:
+            logging.exception("处理鼠标滚轮事件时出错")
+
     def _queue_screen_point(self, x, y, source):
         now = time.monotonic()
         if now - self.last_point_time < POINT_DEDUP_SECONDS:
@@ -355,6 +383,12 @@ class PubgDistanceTool:
     def set_mode(self, mode):
         self.mode.set(mode)
         logging.info("切换地图模式：%s", MODES[mode])
+        self._reset_zoom_to_base()
+        self.recalculate()
+
+    def set_resolution(self):
+        logging.info("切换分辨率：%s", self.resolution.get())
+        self._reset_zoom_to_base()
         self.recalculate()
 
     def reset(self):
@@ -365,12 +399,14 @@ class PubgDistanceTool:
         logging.info("已清空取点")
 
     def recalculate(self):
+        self._clamp_zoom_to_current_limits()
         self._update_scale_text()
         logging.info(
-            "重新计算：resolution=%s mode=%s click_mode=%s points=%s",
+            "重新计算：resolution=%s mode=%s click_mode=%s px_per_100m=%.1f points=%s",
             self.resolution.get(),
             self.mode.get(),
             self.click_mode.get(),
+            self._pixels_per_100m(),
             self.points,
         )
         if len(self.points) == 2:
@@ -412,15 +448,56 @@ class PubgDistanceTool:
         )
 
     def _pixels_per_100m(self):
+        if self.zoom_px_per_100m is not None:
+            return self.zoom_px_per_100m
+        return self._base_pixels_per_100m()
+
+    def _base_pixels_per_100m(self):
         config = RESOLUTIONS[self.resolution.get()]
         if self.mode.get() == "big":
             return config["big_map_px_per_100m"]
         return config["mini_map_px_per_100m"]
 
+    def _max_pixels_per_100m(self):
+        width = int(self.resolution.get().split("x", 1)[0])
+        return ZOOM_MAX_2K_PX_PER_100M * width / 2560
+
+    def adjust_zoom(self, wheel_steps):
+        base_px = self._base_pixels_per_100m()
+        max_px = self._max_pixels_per_100m()
+        current_px = self._pixels_per_100m()
+        factor = ZOOM_STEP_FACTOR ** abs(wheel_steps)
+        if wheel_steps > 0:
+            new_px = current_px * factor
+        else:
+            new_px = current_px / factor
+        self.zoom_px_per_100m = min(max(new_px, base_px), max_px)
+        logging.info(
+            "地图缩放调整：wheel_steps=%s base_px=%.1f max_px=%.1f px_per_100m=%.1f",
+            wheel_steps,
+            base_px,
+            max_px,
+            self.zoom_px_per_100m,
+        )
+        self.recalculate()
+
+    def _clamp_zoom_to_current_limits(self):
+        base_px = self._base_pixels_per_100m()
+        max_px = self._max_pixels_per_100m()
+        if self.zoom_px_per_100m is None:
+            self.zoom_px_per_100m = base_px
+            return
+        self.zoom_px_per_100m = min(max(self.zoom_px_per_100m, base_px), max_px)
+
+    def _reset_zoom_to_base(self):
+        self.zoom_px_per_100m = self._base_pixels_per_100m()
+
     def _update_scale_text(self):
         px = self._pixels_per_100m()
         mode_note = "精确按 4x4 大格估算" if self.mode.get() == "big" else "按小地图中值估算"
-        self.scale_text.set(f"比例：100米 ≈ {px:.1f}px（{mode_note}）")
+        self.scale_text.set(
+            f"比例：100米 ≈ {px:.1f}px（基础 {self._base_pixels_per_100m():.1f}px，最大 {self._max_pixels_per_100m():.1f}px，{mode_note}）"
+        )
 
     def _click_button_label(self):
         return CLICK_MODES[self.click_mode.get()]

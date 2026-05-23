@@ -23,11 +23,17 @@ python pubg_distance_tool.py
 快捷键和鼠标操作：
 
 - 鼠标侧键 `前进` / `后退` 或鼠标右键：按界面选择标记当前鼠标位置
+- 鼠标滚轮向上：等比放大地图比例
+- 鼠标滚轮向下：等比缩小地图比例
 - `M`：切换大地图模式
 - `F1`：切换小地图模式
 - `F2` 或 `Esc`：清空已选点，重新计算
 
-如果在游戏内无法监听按键或侧键，或者右上角浮层被游戏覆盖，可以尝试以管理员身份运行 `PUBGDistanceTool-Global.exe`，并使用无边框窗口化模式运行游戏。
+滚轮缩放会改变当前 `px/100m` 比例，并立即影响距离计算。2K 分辨率下最大为 `290px = 100m`，最小为当前模式的基础值；其他分辨率按屏幕宽度等比换算。切换分辨率或大小地图模式时会重置为对应基础比例。
+
+如果在游戏内无法监听按键或侧键，或者右上角浮层被游戏覆盖，请以管理员身份运行 `PUBGDistanceTool-Global.exe`，并使用无边框窗口化模式运行游戏。打包脚本默认添加 `--uac-admin`，新版 exe 启动时会请求管理员权限。
+
+如果换到另一台没有 Python 环境的电脑，直接运行打包后的 exe 即可，不需要安装 Python。请确认复制的是重新打包后的 `dist\PUBGDistanceTool-Global.exe`，并在启动日志中检查 `admin=True`。
 
 如果管理员运行后仍无法在游戏内取点，请查看 `pubg_distance_tool.log`：如果日志里没有 `轮询鼠标事件` 或 `轮询键盘事件`，说明游戏或反作弊可能拦截了用户态输入读取，普通 Python 工具无法绕过该限制。
 
@@ -51,7 +57,7 @@ dist\PUBGDistanceTool-Global.exe
 
 ```bash
 py -3 -m pip install -r requirements.txt
-py -3 -m PyInstaller --onefile --console --name PUBGDistanceTool-Global pubg_distance_tool.py
+py -3 -m PyInstaller --onefile --console --uac-admin --name PUBGDistanceTool-Global pubg_distance_tool.py
 ```
 
 ## 比例说明

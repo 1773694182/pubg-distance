@@ -24,8 +24,8 @@ RESOLUTIONS = {
     },
     "3840x2160": {
         "label": "3840x2160 (4K)",
-        "big_map_px_per_100m": 76.8,
-        "mini_map_px_per_100m": 230.0,
+        "big_map_px_per_100m": 27.0,
+        "mini_map_px_per_100m": 130.5,
     },
 }
 
@@ -42,7 +42,7 @@ CLICK_MODES = {
 LOG_FILE = "pubg_distance_tool.log"
 POLL_INTERVAL_SECONDS = 0.01
 POINT_DEDUP_SECONDS = 0.15
-ZOOM_STEP_FACTOR = 1.1
+ZOOM_STEPS = 4
 ZOOM_MAX_2K_PX_PER_100M = 290.0
 VK_RBUTTON = 0x02
 VK_XBUTTON1 = 0x05
@@ -466,7 +466,8 @@ class PubgDistanceTool:
         base_px = self._base_pixels_per_100m()
         max_px = self._max_pixels_per_100m()
         current_px = self._pixels_per_100m()
-        factor = ZOOM_STEP_FACTOR ** abs(wheel_steps)
+        step_factor = (max_px / base_px) ** (1.0 / ZOOM_STEPS)
+        factor = step_factor ** abs(wheel_steps)
         if wheel_steps > 0:
             new_px = current_px * factor
         else:
